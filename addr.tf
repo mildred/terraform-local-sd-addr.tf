@@ -31,7 +31,53 @@ output "ula_prefix" {
   value = local.ula_prefix
 }
 
+output "ipv4_network" {
+  value = "127.0.0.0/24"
+}
+
+output "ipv6_network" {
+  value = local.ula_prefix
+}
+
+resource "sys_file" "script" {
+  filename        = "/usr/local/bin/${var.unit_name}"
+  file_permission = "0755"
+  content         = <<EOF
+#!/bin/bash
+
+ULA_PREFIX='${local.ula_prefix}'
+UNIT_NAME='${var.unit_name}'
+
+${file("${path.module}/addr.sh")}
+EOF
+
+  provisioner "local-exec" {
+    command = "systemctl daemon-reload"
+  }
+}
+
+resource "sys_file" "generator" {
+  filename        = "/etc/systemd/system-generators/${var.unit_name}"
+  file_permission = "0755"
+  content         = <<EOF
+#!/bin/bash
+
+ULA_PREFIX='${local.ula_prefix}'
+UNIT_NAME='${var.unit_name}'
+UNIT_TITLE='${replace(title(replace(var.unit_name, "-", " ")), " ", "")}'
+BIN="${sys_file.script.filename}"
+
+${file("${path.module}/addr.generator.sh")}
+EOF
+
+  provisioner "local-exec" {
+    command = "systemctl daemon-reload"
+  }
+}
+
+
 resource "sys_file" "loopback6_service" {
+  file_permission = "0644"
   filename = "/etc/systemd/system/${var.unit_name}-loopback6.service"
   content = <<EOF
 [Unit]
@@ -55,6 +101,7 @@ EOF
 
 
 resource "sys_file" "addr_service" {
+  file_permission = "0644"
   filename = "/etc/systemd/system/${var.unit_name}@.service"
   content = <<EOF
 [Unit]
@@ -66,32 +113,10 @@ After=${var.unit_name}-loopback6.service
 Type=oneshot
 RemainAfterExit=yes
 Environment=ULA_PREFIX=${local.ula_prefix}
+Environment=UNIT_NAME=${var.unit_name}
 Environment=NEW_HOST=%i
-ExecStart=/bin/bash -e -c ' \
-    if [[ -e /run/mailu-addr/$NEW_HOST.env ]]; then \
-      echo "/run/mailu-addr/$NEW_HOST.env: already exists" >&2; \
-      exit 0; \
-    fi; \
-    i=2; \
-    prefix=$(echo $ULA_PREFIX | sed 's:/.*::'); \
-    while egrep -q "^127.0.0.$i " /etc/hosts; do \
-      i=$((i+1)); \
-    done; \
-    ip4="127.0.0.$i"; \
-    ip6="$prefix$(printf %""x $i)"; \
-    echo "$ip4 $NEW_HOST $NEW_HOST""4" >>/etc/hosts; \
-    echo "$ip6 $NEW_HOST $NEW_HOST""6" >>/etc/hosts; \
-    mkdir -p /run/${var.unit_name}; \
-    echo "HOST_$(echo $NEW_HOST | sed 's:-:_:g')6=$ip6" >/run/${var.unit_name}/$NEW_HOST.env; \
-    echo "HOST_$(echo $NEW_HOST | sed 's:-:_:g')4=$ip4" >>/run/${var.unit_name}/$NEW_HOST.env; \
-    ip addr add $ip6 dev lo; \
-    '
-ExecStop=/bin/bash -e -c ' \
-  ip6=$(sed -rn "s/.*6=(.*)/\\\\1/p" /run/${var.unit_name}/$NEW_HOST.env); \
-  /usr/bin/sed -ri -e "/^\\\\S* $${NEW_HOST} $${NEW_HOST}[46]$/d" /etc/hosts; \
-  /bin/rm -f /run/${var.unit_name}/$${NEW_HOST}.env; \
-  ip addr del $ip6 dev lo; \
-  '
+ExecStart=${sys_file.script.filename} up %i
+ExecStop=${sys_file.script.filename} down %i
 
 EOF
 
